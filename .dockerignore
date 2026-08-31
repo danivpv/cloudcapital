@@ -1,0 +1,19 @@
+.git/
+.gitignore
+.venv/
+.cache/
+src/.cache/
+cdk.out/
+# node / next
+src/frontend/node_modules/
+src/frontend/.next/
+src/frontend/out/
+# python artifacts
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+# secrets and local config
+**/.env
+**/.env.*
+# docs
+docs/

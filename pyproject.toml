@@ -1,0 +1,39 @@
+[project]
+name = "cloudcapital"
+version = "0.1.0"
+description = "Cloud Capital surface backend"
+readme = "README.md"
+authors = [{ name = "danivpv", email = "danivpv@gmail.com" }]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "duckdb>=1.2",
+    "dspy>=3.0",
+    "httpx>=0.28",
+    "litellm>=1.60",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "aws-cdk-lib>=2.260.0,<3.0.0",
+    "constructs>=10.5.0,<11.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.5",
+    "ty>=0.0.75",
+]
+
+[tool.ruff]
+extend-exclude = []
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.uv]
+default-groups = ["dev"]

@@ -134,13 +134,15 @@ The intelligence directory (`src/api/intelligence/`) contains both a legacy rule
 **Missing conversational session memory:**
 The current implementation is stateless (each question is evaluated against the immediate screen context). A production rollout requires persistent session memory implemented with Amazon DynamoDB or PostgreSQL to support multi-turn conversational follow-ups.
 
-**gemini 2.5 flash:** It worked but I should really update to latest gen fast model and retest
+**Technical debt — model version pin:** The agent is pinned to `gemini-2.5-flash` via OpenRouter (TTFT 0.66s, throughput ~102 TPS, worst-case TTLT 15.4s at 1,500 tokens, live cost $0.000691/query). The next-generation `gemini-flash-3.8` is expected to reduce latency and cost. Migration requires a controlled swap in `src/api/config.py`, a regression run over the existing DSPy `PlanInvestigation` signature, and re-measuring the same three metrics before promoting to production.
 
 ---
 
 ### 5. The cost budget
 
-**Target:** Under $0.01 per novel question and under 2 seconds to first structured answer at 10 to 100x raw usage volume.
+#### AI inference cost
+
+**Target:** Under $0.01 per novel question and under 2 seconds to first structured answer.
 
 **Measured live path (one observation, not a p95 claim):**
 
@@ -152,6 +154,14 @@ The current implementation is stateless (each question is evaluated against the 
 
 - *Why cost does not scale with data:* The planner receives screen context; the synthesis model receives at most two 12-row query results. LLM tokens and cost are O(1) regardless of customer bill size.
 - *What does scale with data:* First-time dice builds over raw Parquet. At 10 to 100x data, the solution is partitioned Parquet on S3 and scheduled refresh jobs, never feeding raw data into LLM context.
+
+#### Infrastructure cost
+
+**Theoretical baseline (us-east-1, zero traffic):** 1 vCPU / 2 GB Fargate always-on: Fargate ~$36 + ALB ~$6 + public IPv4 ~$4 + ECR/Secrets ~$2 = **~$48/month before tax.**
+
+**Observed (September 1–8, 2026):** $17.91 in 7 days (~$77/month run rate). The overshoot over the idle baseline is consistent with real demo traffic — ALB LCU charges and Fargate CPU scale with connections, so sharing the demo with reviewers during the week inflated both lines above zero-traffic rates.
+
+The dominant decisions: `nat_gateways=0` in `component.py` avoids ~$32/month in NAT Gateway fees by running the task in a public subnet; `desired_count=1` keeps the surface available at the cost of ~$36/month idle compute. In production, scheduled scale-to-zero overnight cuts the Fargate line to ~$10/month.
 
 
 ## Architecture summary

@@ -2,12 +2,17 @@
 .gitignore
 .venv/
 .cache/
-src/.cache/
+.aws-sam/
+.kilo/
 cdk.out/
-# node / next
-src/frontend/node_modules/
-src/frontend/.next/
-src/frontend/out/
+.pytest_cache/
+.ruff_cache/
+# raw source data: only needed by scripts/precompute_data.py, never in images
+data/
+# frontend builds via Amplify, not docker
+src/frontend/
+# baked data is COPYed from src/economics/data (tracked there via build),
+# but raw sources and caches never belong in an image context
 # python artifacts
 **/__pycache__/
 **/*.pyc

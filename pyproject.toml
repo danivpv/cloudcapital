@@ -5,21 +5,28 @@ description = "Cloud Capital surface backend"
 readme = "README.md"
 authors = [{ name = "danivpv", email = "danivpv@gmail.com" }]
 requires-python = ">=3.12"
-dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.34",
-    "duckdb>=1.2",
-    "dspy>=3.0",
-    "httpx>=0.28",
-    "litellm>=1.60",
-    "pydantic>=2.10",
-    "pydantic-settings>=2.7",
+dependencies = []
+
+[dependency-groups]
+infra = [
     "aws-cdk-lib>=2.260.0,<3.0.0",
     "constructs>=10.5.0,<11.0.0",
 ]
-
-[dependency-groups]
+economics = [
+    "boto3>=1.40",
+    "duckdb>=1.2",
+]
+ai = [
+    "boto3>=1.40",
+    "duckdb>=1.2",
+    "dspy>=3.0",
+    "fastapi>=0.115",
+    "litellm>=1.60",
+    "pydantic>=2.10",
+    "uvicorn>=0.30",
+]
 dev = [
+    "aws-sam-cli>=1.166.2",
     "pytest>=9.1.1",
     "ruff>=0.16.5",
     "ty>=0.0.75",
@@ -36,4 +43,8 @@ ignore = ["E501"]
 combine-as-imports = true
 
 [tool.uv]
-default-groups = ["dev"]
+default-groups = ["dev", "infra", "economics", "ai"]
+
+[tool.pytest.ini_options]
+norecursedirs = ["cdk.out", ".venv", "dist", "build", "node_modules"]
+pythonpath = ["."]

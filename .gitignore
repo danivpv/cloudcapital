@@ -1,7 +1,5 @@
 # secrets — never commit
 .env
-frontend/.env.local
-.env
 
 # python
 .venv/
@@ -9,20 +7,24 @@ __pycache__/
 *.pyc
 
 # node
-frontend/node_modules/
-frontend/.next/
-frontend/out/
 npm-debug.log*
 
 # misc
 .DS_Store
 
-# data
-.cache
-data.parquet/
+# IDE
+.kilo
 
-# cache 
+# data — raw parquets (data/) and baked outputs (src/economics/data/) are
+# large binaries; regenerate baked data with `make precompute`.
+# SAM fixtures live in tests/events/ (tracked).
+data/
+src/economics/data/
+.aws-sam/
+
+# cache
 .ruff_cache
+.pytest_cache
 
 # cdk
 cdk.out/

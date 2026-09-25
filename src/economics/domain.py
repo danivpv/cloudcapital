@@ -1,13 +1,6 @@
-"""Pure commitment-economics math — ported verbatim from the provided service.
+"""Settled commitment economics domain math.
 
-This is the settled logic: the hourly allocation, the cost-of-risk stand-in, and
-the customer/reserve/profit split. It is intentionally free of HTTP and I/O
-concerns (those live in ``app.py``) so it can be unit-tested and reasoned about
-in isolation.
-
-One addition over the original: ``impact_dice``, which collapses the per-line
-impact into per-dimension monthly aggregates *here*, on the correct side of the
-boundary, so the surface never transfers the firehose.
+Executes over precomputed lines.parquet, retaining exact financial formulas.
 """
 
 from __future__ import annotations
@@ -15,33 +8,18 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
-# Data directory resolution (supports local dev and container paths)
-_DATA_DIR_ENV = os.environ.get("CC_DATA_DIR")
-if _DATA_DIR_ENV:
-    _DATA = Path(_DATA_DIR_ENV)
-else:
-    _SRC_DIR = Path(__file__).resolve().parents[2]
-    if (_SRC_DIR / "data.parquet").exists():
-        _DATA = _SRC_DIR / "data.parquet"
-    elif (_SRC_DIR / "data").exists():
-        _DATA = _SRC_DIR / "data"
-    else:
-        _DATA = _SRC_DIR / "data.parquet"
-
-USAGE_PATH = os.environ.get("USAGE_PARQUET", str(_DATA / "candidate_dataset.parquet"))
-PRICING_PATH = os.environ.get(
-    "PRICING_PARQUET", str(_DATA / "pricing_options_filtered.parquet")
-)
+_DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data"
+_DATA_DIR = Path(os.environ.get("CC_DATA_DIR", _DEFAULT_DATA_DIR))
+LINES_PARQUET = _DATA_DIR / "lines.parquet"
 
 PROFIT_RATE = 0.10
 COR_MIN_POINTS = 4.0
 COR_MAX_POINTS = 80.0
 
-# Canonical dimension SQL: single source of truth, shared with the store so the
-# savings dice and the usage dice key on identical expressions.
 DIM_SQL: dict[str, str] = {
     "service": "product_code",
     "account": "account_id",
@@ -62,40 +40,23 @@ class Proposal:
     payment_option: str = "no_upfront"
 
 
-def connect() -> duckdb.DuckDBPyConnection:
-    """A connection with the eligible Compute usage lines pre-loaded."""
-    con = duckdb.connect()
-    con.execute(
-        f"""
-        CREATE TABLE lines AS
-        WITH elig AS (
-          SELECT u.timestamp, u.account_id, u.product_code, u.usage_type,
-                 u.instance_type, u.commitment_key, u.price_list_key,
-                 u.on_demand_cost, u.usage_amount, p.rate AS sp_rate, p.term_months
-          FROM '{USAGE_PATH}' u
-          JOIN '{PRICING_PATH}' p
-            ON u.price_list_key = p.price_list_key
-           AND p.instrument_type = 'compute_savings_plan'
-           AND p.payment_option = 'no_upfront'
-          WHERE u.commitment_key LIKE 'AWS#Compute%'
-            AND u.usage_amount > 0 AND u.on_demand_cost > 0
+DEFAULT_PROPOSAL = Proposal()
+
+
+def get_connection() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect(":memory:")
+    if LINES_PARQUET.exists():
+        con.execute(
+            f"CREATE VIEW lines AS SELECT * FROM read_parquet('{LINES_PARQUET.as_posix()}')"
         )
-        SELECT *,
-          usage_amount * sp_rate AS line_disc_cost,
-          1 - sp_rate / (on_demand_cost / usage_amount) AS discount
-        FROM elig
-        WHERE 1 - sp_rate / (on_demand_cost / usage_amount) BETWEEN 0 AND 0.95
-        """
-    )
     return con
 
 
-def _impact_relation(con, p: Proposal):
-    """Per-line hourly impact of the proposed commitment, as an unmaterialized relation."""
+def _impact_relation(con: duckdb.DuckDBPyConnection, p: Proposal) -> None:
     L = float(p.commitment_per_hour)
     con.execute(
-        "CREATE OR REPLACE TEMP VIEW impact AS "
-        + f"""
+        f"""
+        CREATE OR REPLACE TEMP VIEW impact AS
         WITH ranked AS (
           SELECT timestamp, account_id, product_code, usage_type, instance_type,
                  commitment_key, on_demand_cost, line_disc_cost, discount,
@@ -113,8 +74,8 @@ def _impact_relation(con, p: Proposal):
         """
     )
     con.execute(
-        "CREATE OR REPLACE TEMP VIEW impact_rows AS "
         """
+        CREATE OR REPLACE TEMP VIEW impact_rows AS
         SELECT timestamp, account_id, product_code, usage_type, instance_type, commitment_key,
                covered_on_demand_cost, committed_cost,
                covered_on_demand_cost - committed_cost AS gross_savings
@@ -124,17 +85,9 @@ def _impact_relation(con, p: Proposal):
 
 
 def impact_dice(
-    con, p: Proposal, dims: list[str] | None = None
-) -> dict[str, list[dict]]:
-    """Per-(dim, month) savings aggregates, collapsed here rather than at the surface.
-
-    One allocation pass, then a cheap GROUP BY per requested dimension — the
-    ~700-row-per-dim shape the surface needs, never the ~1M-row firehose.
-    """
+    con: duckdb.DuckDBPyConnection, p: Proposal, dims: list[str] | None = None
+) -> dict[str, list[dict[str, Any]]]:
     dims = dims or list(DIM_SQL)
-    for d in dims:
-        if d not in DIM_SQL:
-            raise ValueError(f"unknown dimension: {d}")
     _impact_relation(con, p)
     keys = [
         "dim_value",
@@ -143,7 +96,7 @@ def impact_dice(
         "committed_cost",
         "gross_savings",
     ]
-    out: dict[str, list[dict]] = {}
+    out: dict[str, list[dict[str, Any]]] = {}
     for d in dims:
         expr = DIM_SQL[d]
         rows = con.execute(
@@ -161,7 +114,9 @@ def impact_dice(
     return out
 
 
-def _aggregate_economics(con, p: Proposal) -> dict:
+def _aggregate_economics(
+    con: duckdb.DuckDBPyConnection, p: Proposal
+) -> dict[str, float]:
     _impact_relation(con, p)
     L = float(p.commitment_per_hour)
     covered, committed, gross = con.execute(
@@ -184,8 +139,7 @@ def _aggregate_economics(con, p: Proposal) -> dict:
     }
 
 
-def cost_of_risk(con, p: Proposal) -> dict:
-    """A plausible stand-in for our proprietary cost-of-risk model."""
+def cost_of_risk(con: duckdb.DuckDBPyConnection, p: Proposal) -> dict[str, Any]:
     _impact_relation(con, p)
     L = float(p.commitment_per_hour)
     protection = (
@@ -230,14 +184,18 @@ def cost_of_risk(con, p: Proposal) -> dict:
     }
 
 
-def economics(con, p: Proposal) -> dict:
-    """Headline economics: aggregate impact, cost of risk, and the split."""
+def economics(con: duckdb.DuckDBPyConnection, p: Proposal) -> dict[str, Any]:
     agg = _aggregate_economics(con, p)
     cor = cost_of_risk(con, p)
     S = agg["net_savings"]
     profit = PROFIT_RATE * S
     reserve = (cor["cost_of_risk_points"] / 100.0) * S
     customer_savings = S - profit - reserve
+    rate = (
+        (customer_savings / agg["covered_on_demand_cost"])
+        if agg["covered_on_demand_cost"]
+        else 0.0
+    )
     return {
         "proposal": asdict(p),
         **agg,
@@ -245,7 +203,5 @@ def economics(con, p: Proposal) -> dict:
         "profit": profit,
         "reserve": reserve,
         "customer_savings": customer_savings,
-        "customer_savings_rate": (customer_savings / agg["covered_on_demand_cost"])
-        if agg["covered_on_demand_cost"]
-        else 0.0,
+        "customer_savings_rate": rate,
     }

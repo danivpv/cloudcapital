@@ -1,31 +1,27 @@
-"""CDK stack: Amplify-hosted Next.js frontend plus an always-on ECS API.
-
-Inputs are CloudFormation parameters so deployment credentials and identifiers
-never enter source control. The stack deliberately requires HTTPS: the ALB
-header is a shared secret and must not traverse the public internet over HTTP.
-"""
+"""CDK stack: Serverless API (API Gateway + Lambdas) plus Amplify Next.js frontend."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import aws_cdk as cdk
 from aws_cdk import (
     CfnOutput,
     CfnParameter,
+    RemovalPolicy,
     Stack,
-    aws_ec2 as ec2,
+    aws_apigateway as apigw,
+    aws_s3 as s3,
     aws_secretsmanager as secretsmanager,
 )
 from constructs import Construct
 
-from .api.infrastructure import ApiConstruct
+from .ai.infrastructure import AiConstruct
+from .economics.infrastructure import EconomicsConstruct
 from .frontend.infrastructure import FrontendConstruct
 
 
 class CloudCapitalStack(Stack):
-    """Integrates the always-on backend API and the Amplify frontend."""
+    """Integrates serverless Economics and AI microservices with the Amplify frontend."""
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs: Any) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -54,48 +50,101 @@ class CloudCapitalStack(Stack):
             description="Secrets Manager ARN holding the OpenRouter API key.",
         )
 
-        vpc = ec2.Vpc(
+        # 1. S3 Data bucket for precomputed analytical dice & parquet datasets
+        self.data_bucket = s3.Bucket(
             self,
-            "Vpc",
-            max_azs=2,
-            nat_gateways=0,
-            subnet_configuration=[
-                ec2.SubnetConfiguration(
-                    name="Public", subnet_type=ec2.SubnetType.PUBLIC
-                )
-            ],
+            "DataBucket",
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            enforce_ssl=True,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
         )
-        openrouter_secret = secretsmanager.Secret.from_secret_complete_arn(
-            self, "OpenRouterSecret", openrouter_secret_arn.value_as_string
-        )
-        header_secret = secretsmanager.Secret(
+
+        # 2. Shared secret for server-to-server auth between Amplify proxy and API
+        self.header_secret = secretsmanager.Secret(
             self,
             "ApiHeaderSecret",
             generate_secret_string=secretsmanager.SecretStringGenerator(
-                secret_string_template='{}',
+                secret_string_template="{}",
                 generate_string_key="header",
                 password_length=40,
                 exclude_punctuation=True,
             ),
         )
-        header_value = header_secret.secret_value_from_json("header").unsafe_unwrap()
+        header_value = self.header_secret.secret_value_from_json(
+            "header"
+        ).unsafe_unwrap()
 
-        repository_root = Path(__file__).resolve().parents[1]
-        self.api = ApiConstruct(
-            self,
-            "Api",
-            vpc=vpc,
-            api_header_value=header_value,
-            openrouter_secret=openrouter_secret,
-            repository_root=repository_root,
+        openrouter_secret = secretsmanager.Secret.from_secret_complete_arn(
+            self, "OpenRouterSecret", openrouter_secret_arn.value_as_string
         )
 
+        # 3. Microservice Constructs
+        self.economics = EconomicsConstruct(
+            self,
+            "Economics",
+            data_bucket=self.data_bucket,
+            header_secret=self.header_secret,
+        )
+
+        self.ai = AiConstruct(
+            self,
+            "Ai",
+            openrouter_secret=openrouter_secret,
+            header_secret=self.header_secret,
+        )
+
+        # 4. API Gateway REST API with Payload Response Streaming
+        self.api = apigw.RestApi(
+            self,
+            "ApiGateway",
+            rest_api_name="CloudCapitalApi",
+            description="Serverless API routing to Economics and streaming AI Agent Lambdas.",
+            default_cors_preflight_options=apigw.CorsOptions(
+                allow_origins=apigw.Cors.ALL_ORIGINS,
+                allow_methods=apigw.Cors.ALL_METHODS,
+                allow_headers=["*"],
+            ),
+            deploy_options=apigw.StageOptions(
+                stage_name="prod",
+            ),
+        )
+
+        # AI Agent routes with true response streaming. The AI container runs
+        # uvicorn behind the AWS Lambda Web Adapter, which produces the
+        # InvokeWithResponseStream wire format Python runtimes cannot emit
+        # natively. The escape hatch sets STREAM + the streaming URI + a 60s
+        # integration timeout (default 29s is short for LLM agents).
+        ai_integration = apigw.LambdaIntegration(self.ai.function)
+        assistant_resource = self.api.root.add_resource("assistant")
+        assistant_method = assistant_resource.add_method("POST", ai_integration)
+
+        ask_resource = self.api.root.add_resource("ask")
+        ask_method = ask_resource.add_method("POST", ai_integration)
+
+        for method in (assistant_method, ask_method):
+            cfn_method = method.node.default_child
+            cfn_method.add_property_override("Integration.ResponseTransferMode", "STREAM")
+            cfn_method.add_property_override("Integration.TimeoutInMillis", 60_000)
+            # Streaming invocation URI: routes the call through
+            # InvokeWithResponseStream instead of the standard Invoke action.
+            cfn_method.add_property_override(
+                "Integration.Uri",
+                f"arn:aws:apigateway:{self.region}:lambda:path/2021-11-15/functions/"
+                + f"{self.ai.function.function_arn}/response-streaming-invocations",
+            )
+
+        # Economics & Data routes (default proxy)
+        econ_integration = apigw.LambdaIntegration(self.economics.function)
+        self.api.root.add_method("ANY", econ_integration)
+        self.api.root.add_proxy(
+            default_integration=econ_integration,
+            any_method=True,
+        )
+
+        # 5. Frontend Construct (Amplify Next.js SSR)
         github_token = secretsmanager.Secret.from_secret_complete_arn(
             self, "GithubToken", github_token_secret_arn.value_as_string
-        )
-        # The ALB DNS name is the API base URL. No custom domain needed for the demo.
-        api_base_url = cdk.Fn.join(
-            "", ["http://", self.api.load_balancer.load_balancer_dns_name]
         )
         self.frontend = FrontendConstruct(
             self,
@@ -103,22 +152,12 @@ class CloudCapitalStack(Stack):
             repository=repository.value_as_string,
             branch_name=branch_name.value_as_string,
             github_token=github_token,
-            api_base_url=api_base_url,
+            api_base_url=self.api.url,
             api_header_value=header_value,
         )
 
-        CfnOutput(
-            self,
-            "ApiLoadBalancerDns",
-            value=self.api.load_balancer.load_balancer_dns_name,
-        )
+        # Outputs
+        CfnOutput(self, "ApiGatewayUrl", value=self.api.url)
+        CfnOutput(self, "DataBucketName", value=self.data_bucket.bucket_name)
         CfnOutput(self, "AmplifyDefaultDomain", value=self.frontend.default_domain)
-        CfnOutput(self, "ApiHeaderSecretArn", value=header_secret.secret_arn)
-
-
-# Keep the cdk alias import usable for any module that uses `cdk.App` in app.py
-_ = cdk
-
-# Backward compatibility aliases
-AlwaysOnApi = ApiConstruct
-AmplifyFrontend = FrontendConstruct
+        CfnOutput(self, "ApiHeaderSecretArn", value=self.header_secret.secret_arn)
